@@ -17,11 +17,18 @@ from app.config import (
     SEVERITY_LEVELS,
 )
 
+# Ensure database schema and non-destructive column migrations are applied
+try:
+    db.initialize_database()
+except Exception:
+    pass
+
 
 _safe_html_text = helpers.safe_html_text
 _clean_html_block = helpers.clean_html_block
 _format_remediation_html = helpers.format_remediation_html
 _format_fallback_guidance = helpers.format_fallback_guidance
+_format_file_size = helpers.format_file_size
 
 
 st.set_page_config(
@@ -745,7 +752,15 @@ with st.sidebar:
         "Simulation Lab",
         "Evaluation"
     ]
-    target_nav = st.session_state.pop("nav_page", None)
+    url_page = None
+    try:
+        url_param = st.query_params.get("page")
+        if url_param and url_param in nav_options:
+            url_page = url_param
+    except Exception:
+        url_page = None
+
+    target_nav = st.session_state.pop("nav_page", None) or url_page
     if target_nav in nav_options:
         st.session_state["main_nav_radio"] = target_nav
 
@@ -777,7 +792,10 @@ def compute_journey_stage_statuses(
     incident: Optional[Dict[str, Any]],
     investigations: List[Dict[str, Any]],
     audit_logs: List[Dict[str, Any]],
-    total_docs: int = 0
+    total_docs: int = 0,
+    retrieved_chunks: Optional[List[Dict[str, Any]]] = None,
+    retrieval_executed: bool = False,
+    is_stale: bool = False,
 ) -> Dict[int, Dict[str, Any]]:
     """Derive real status for all 7 stages from actual persisted records and available evidence.
 
@@ -897,10 +915,26 @@ def compute_journey_stage_statuses(
             "narrative": "OpsPilot scans enterprise runbooks and standard operating procedures (SOPs). Currently, 0 documents are indexed in the Knowledge Base.",
             "evidence_summary": "Knowledge Base contains 0 indexed documents. Retrieval returned 0 reference chunks. Investigation will proceed with general diagnostic reasoning.",
         }
+    elif is_stale:
+        stages[3] = {
+            "name": "Knowledge Retrieval",
+            "short_title": "3. Retrieval",
+            "state": "attention",
+            "badge": "⚠️",
+            "pill": "Query Modified",
+            "label": "Re-Run Needed",
+            "subtext": "Query edited — click Retrieve Evidence",
+            "is_completed": False,
+            "narrative": "The search query was modified. Previous retrieval results are outdated and must be refreshed before proceeding.",
+            "evidence_summary": "Search query was modified. Click 'Retrieve Evidence' to execute a new search with the updated keywords.",
+        }
     else:
         chunks = []
-        if investigations:
-            chunks = investigations[0].get("retrieved_evidence") or []
+        if retrieved_chunks is not None:
+            chunks = retrieved_chunks
+        elif investigations:
+            chunks = investigations[0].get("retrieved_evidence") or investigations[0].get("provenance") or []
+
         if chunks:
             stages[3] = {
                 "name": "Knowledge Retrieval",
@@ -914,6 +948,19 @@ def compute_journey_stage_statuses(
                 "narrative": "Internal documentation was scanned and relevant procedure chunks were retrieved to ground the diagnostic investigation.",
                 "evidence_summary": f"Retrieved {len(chunks)} relevant runbook chunks from {total_docs} indexed documents via BM25 full-text search.",
             }
+        elif retrieval_executed:
+            stages[3] = {
+                "name": "Knowledge Retrieval",
+                "short_title": "3. Retrieval",
+                "state": "attention",
+                "badge": "⚠️",
+                "pill": "No Match",
+                "label": "0 Chunks Matched",
+                "subtext": "No relevant runbook sections found",
+                "is_completed": False,
+                "narrative": "Knowledge Base search was executed against indexed runbooks, but no matching evidence was found for the current query.",
+                "evidence_summary": f"Full-text BM25 search across {total_docs} runbooks returned 0 matching chunks. Refine search query keywords or verify runbook coverage.",
+            }
         else:
             stages[3] = {
                 "name": "Knowledge Retrieval",
@@ -922,7 +969,7 @@ def compute_journey_stage_statuses(
                 "badge": "3",
                 "pill": "Ready",
                 "label": f"{total_docs} Runbooks Available",
-                "subtext": "Ready for automated search",
+                "subtext": "Ready for evidence retrieval",
                 "is_completed": False,
                 "narrative": "Internal documents are indexed and ready for automated search once diagnostic analysis is initiated.",
                 "evidence_summary": f"{total_docs} standard runbooks indexed in Knowledge Base. Ready for automated query extraction.",
@@ -1272,12 +1319,40 @@ if page == "Incident Journey":
         except Exception:
             total_docs = 0
 
+        # Session-state retrieval integration for Stage 3
+        retrieval_session_key = f"journey_retrieval_{selected_id}"
+        retrieval_info = st.session_state.get(retrieval_session_key)
+
+        default_query = rag_service.build_incident_search_query(
+            title=selected_incident.get("title", ""),
+            description=selected_incident.get("description", ""),
+            category=selected_incident.get("category", "")
+        )
+
+        query_input_key = f"journey_query_input_{selected_id}"
+        if query_input_key not in st.session_state:
+            st.session_state[query_input_key] = default_query
+
+        # Detect staleness: if operator edited query since last retrieval run
+        is_query_stale = False
+        if retrieval_info and retrieval_info.get("executed"):
+            last_searched_query = retrieval_info.get("query", "").strip()
+            current_typed_query = st.session_state.get(query_input_key, "").strip()
+            if current_typed_query != last_searched_query:
+                is_query_stale = True
+
+        retrieved_chunks = retrieval_info.get("chunks") if (retrieval_info and not is_query_stale) else None
+        retrieval_executed = retrieval_info.get("executed", False) if (retrieval_info and not is_query_stale) else False
+
         # Compute statuses across all 7 stages
         stage_statuses = compute_journey_stage_statuses(
             incident=selected_incident,
             investigations=deserialized_invs,
             audit_logs=audit_logs,
-            total_docs=total_docs
+            total_docs=total_docs,
+            retrieved_chunks=retrieved_chunks,
+            retrieval_executed=retrieval_executed,
+            is_stale=is_query_stale,
         )
 
         # Overview Card for Selected Incident
@@ -1357,9 +1432,155 @@ if page == "Incident Journey":
                         st.session_state["nav_page"] = "Incident Center"
                         st.rerun()
                 elif i == 3:
-                    if st.button("Open Knowledge Base Workspace ➔", key="journey_btn_kb_3"):
-                        st.session_state["nav_page"] = "Knowledge Base"
-                        st.rerun()
+                    st.markdown(_clean_html_block(f"""
+                    <div style="margin-top: 18px; margin-bottom: 8px;">
+                        <span class="eyebrow">EVIDENCE RETRIEVAL WORKSPACE</span>
+                        <div class="main-title" style="font-size: 18px; margin-top: 4px;">Search Operational Runbooks</div>
+                        <div style="color: #64748B; font-size: 13px; margin-top: 2px;">
+                            Retrieve verified procedure chunks using BM25 full-text indexing to ground this incident's diagnosis.
+                        </div>
+                    </div>
+                    """), unsafe_allow_html=True)
+
+                    if total_docs == 0:
+                        st.info("ℹ️ The Knowledge Base currently contains 0 documents. Ingest operational runbooks (.md, .txt, .pdf) in the Knowledge Base workspace to enable grounded evidence retrieval.")
+                        if st.button("Open Knowledge Base Workspace ➔", key="journey_btn_kb_empty_3"):
+                            st.session_state["nav_page"] = "Knowledge Base"
+                            st.rerun()
+                    else:
+                        query_val = st.text_input(
+                            "Incident Search Query (derived from title, symptoms & category):",
+                            key=query_input_key,
+                            help="Edit the search query to test different technical keywords or error codes."
+                        )
+
+                        col_k, col_btns = st.columns([1, 2])
+                        with col_k:
+                            top_k = st.slider(
+                                "Max Chunks (Top-K)",
+                                min_value=1,
+                                max_value=10,
+                                value=5,
+                                key=f"journey_top_k_{selected_id}"
+                            )
+
+                        with col_btns:
+                            st.write("")
+                            b_col1, b_col2, b_col3 = st.columns([2, 2, 3])
+                            with b_col1:
+                                do_retrieve = st.button("🔍 Retrieve Evidence", key=f"btn_retrieve_{selected_id}", type="primary", use_container_width=True)
+                            with b_col2:
+                                if st.button("↺ Reset Query", key=f"btn_reset_query_{selected_id}", use_container_width=True):
+                                    st.session_state[query_input_key] = default_query
+                                    st.rerun()
+                            with b_col3:
+                                if st.button("Knowledge Base ➔", key="journey_btn_kb_3", use_container_width=True):
+                                    st.session_state["nav_page"] = "Knowledge Base"
+                                    st.rerun()
+
+                        if do_retrieve:
+                            clean_q = query_val.strip()
+                            if not clean_q:
+                                st.error("Please enter a non-empty search query before retrieving evidence.")
+                            else:
+                                with st.spinner("Searching Knowledge Base with BM25 ranking..."):
+                                    chunks_res = rag_service.retrieve_knowledge_chunks(
+                                        query=clean_q,
+                                        limit=top_k
+                                    )
+                                    st.session_state[retrieval_session_key] = {
+                                        "incident_id": selected_id,
+                                        "query": clean_q,
+                                        "chunks": chunks_res,
+                                        "executed": True,
+                                        "timestamp": helpers.get_utc_now(),
+                                    }
+                                    st.session_state[f"incident_retrieved_evidence_{selected_id}"] = {
+                                        "incident_id": selected_id,
+                                        "search_query": clean_q,
+                                        "total_chunks_retrieved": len(chunks_res),
+                                        "chunks": chunks_res,
+                                        "executed": True,
+                                    }
+                                st.rerun()
+
+                        # Display Results / Status
+                        if is_query_stale and retrieval_info:
+                            st.warning(f"⚠️ Search query was edited from \"{retrieval_info.get('query')}\" to \"{query_val.strip()}\". Results below are from the previous query. Click **Retrieve Evidence** to run a new search.")
+
+                        active_chunks = retrieval_info.get("chunks") if retrieval_info else None
+                        has_executed = retrieval_info.get("executed", False) if retrieval_info else False
+
+                        # If not executed in session, check if existing investigation had persisted chunks
+                        if not has_executed and deserialized_invs:
+                            persisted_p = deserialized_invs[0].get("retrieved_evidence") or deserialized_invs[0].get("provenance") or []
+                            if persisted_p:
+                                active_chunks = persisted_p
+                                has_executed = True
+                                st.info(f"Showing {len(persisted_p)} runbook chunks previously persisted for Investigation #{deserialized_invs[0].get('id')}. Click **Retrieve Evidence** above to run a new search.")
+
+                        if has_executed:
+                            if active_chunks:
+                                st.markdown(_clean_html_block(f"""
+                                <div style="display: flex; justify-content: space-between; align-items: center; margin-top: 14px; margin-bottom: 8px;">
+                                    <span style="color: #0F172A; font-weight: 600; font-size: 14px;">
+                                        Retrieved Evidence Packets ({len(active_chunks)} chunks)
+                                    </span>
+                                    <span class="journey-step-pill completed">BM25 RANKED</span>
+                                </div>
+                                <div style="font-size: 12px; color: #64748B; background: #F8FAFC; border-left: 3px solid #3B82F6; padding: 8px 12px; border-radius: 4px; margin-bottom: 12px; line-height: 1.4;">
+                                    🛡️ <strong>Grounded Retrieval Boundary:</strong> The chunks below represent unaltered source text from verified operational runbooks indexed in the Knowledge Base. BM25 scores represent raw lexical ranking.
+                                </div>
+                                """), unsafe_allow_html=True)
+
+                                for chk in active_chunks:
+                                    c_doc = _safe_html_text(chk.get("document_name") or "Unknown Document")
+                                    c_page = chk.get("page_number", 1)
+                                    c_idx = chk.get("chunk_index", 0)
+                                    c_rank = chk.get("rank", 1)
+                                    c_score = chk.get("bm25_score", 0.0)
+                                    c_cite = _safe_html_text(chk.get("citation") or f"[{c_doc}, p.{c_page} #{c_idx}]")
+                                    c_content = helpers.clean_text(chk.get("content") or "")
+
+                                    st.markdown(_clean_html_block(f"""
+                                    <div style="background: #FFFFFF; border: 1px solid #E2E8F0; border-radius: 8px; padding: 12px 16px; margin-bottom: 10px;">
+                                        <div style="display: flex; justify-content: space-between; align-items: center; flex-wrap: wrap; gap: 8px;">
+                                            <div style="display: flex; align-items: center; gap: 8px;">
+                                                <span class="journey-step-pill completed" style="font-family: monospace; font-size: 11px;">{c_cite}</span>
+                                                <strong style="color: #0F172A; font-size: 13.5px;">{c_doc}</strong>
+                                                <span style="color: #64748B; font-size: 12px;">• Page {c_page} • Chunk #{c_idx} • Rank #{c_rank}</span>
+                                            </div>
+                                            <div style="font-size: 12px; color: #475569;">
+                                                BM25 Score: <strong style="color: #1E293B;">{c_score:.4f}</strong>
+                                            </div>
+                                        </div>
+                                        <pre style="background: #F8FAFC; border: 1px solid #E2E8F0; border-radius: 6px; padding: 10px; font-size: 12.5px; color: #1E293B; white-space: pre-wrap; font-family: 'JetBrains Mono', 'Fira Code', monospace; line-height: 1.5; margin-top: 8px; margin-bottom: 0;">{c_content}</pre>
+                                    </div>
+                                    """), unsafe_allow_html=True)
+
+                                if st.button("Proceed to Stage 4: AI Root Cause Investigation ➔", key=f"journey_btn_proceed_to_ai_{selected_id}"):
+                                    st.session_state["nav_page"] = "AI Investigation"
+                                    st.session_state["selected_investigation_incident_id"] = selected_id
+                                    st.rerun()
+
+                            else:
+                                searched_q = _safe_html_text(retrieval_info.get("query", ""))
+                                st.markdown(_clean_html_block(f"""
+                                <div style="background: #FFFBEB; border: 1px solid #FDE68A; border-radius: 8px; padding: 14px 18px; margin-top: 10px;">
+                                    <div style="display: flex; align-items: center; gap: 8px;">
+                                        <span class="journey-step-pill attention">0 MATCHES</span>
+                                        <strong style="color: #92400E; font-size: 14px;">No matching runbook evidence found</strong>
+                                    </div>
+                                    <div style="color: #78350F; font-size: 13px; margin-top: 6px; line-height: 1.5;">
+                                        The Knowledge Base scanned <strong>{total_docs}</strong> indexed runbooks, but found 0 matching chunks for query: <code>{searched_q}</code>.
+                                    </div>
+                                    <div style="color: #92400E; font-size: 12px; margin-top: 8px;">
+                                        💡 <strong>Next steps:</strong> Try adjusting the query with specific error codes (e.g. <code>504</code>, <code>timeout</code>, <code>pool</code>), or upload additional SOPs in the Knowledge Base workspace.
+                                    </div>
+                                </div>
+                                """), unsafe_allow_html=True)
+                        else:
+                            st.info(f"💡 {total_docs} runbooks are indexed and ready in the Knowledge Base. The suggested query above was generated from incident #{selected_incident.get('formatted_id', selected_id)}'s reported title, category, and symptoms. Click **Retrieve Evidence** to run BM25 search.")
                 elif i in (4, 5, 6):
                     if st.button("Open AI Investigation Workspace ➔", key=f"journey_btn_ai_{i}"):
                         st.session_state["nav_page"] = "AI Investigation"
@@ -2092,9 +2313,21 @@ elif page == "AI Investigation":
         def _execute_investigation():
             try:
                 with st.spinner("Retrieving knowledge runbooks and conducting AI root-cause investigation with Gemini..."):
+                    # Check if pre-retrieved evidence exists for this incident from Stage 3
+                    pre_retrieved = st.session_state.get(f"incident_retrieved_evidence_{selected_id}") or st.session_state.get(f"journey_retrieval_{selected_id}")
+                    retrieved_evidence_bundle = None
+                    if pre_retrieved and pre_retrieved.get("executed"):
+                        retrieved_evidence_bundle = {
+                            "incident_id": selected_id,
+                            "search_query": pre_retrieved.get("query") or pre_retrieved.get("search_query", ""),
+                            "total_chunks_retrieved": len(pre_retrieved.get("chunks", [])),
+                            "chunks": pre_retrieved.get("chunks", []),
+                        }
+
                     # Strict refinement 1: default timeout is 45s
                     inv_data = ai_service.investigate_incident(
                         incident_data=selected_incident,
+                        retrieved_evidence=retrieved_evidence_bundle,
                         timeout=45,
                     )
 
@@ -2823,10 +3056,332 @@ elif page == "Knowledge Base":
     st.markdown('<div class="eyebrow">DOCUMENTS / RAG</div>', unsafe_allow_html=True)
     st.markdown('<div class="main-title">Knowledge Base</div>', unsafe_allow_html=True)
     st.markdown(
-        '<div class="subtitle">Manage standard operating procedures and runbooks.</div>',
+        '<div class="subtitle">Manage operational runbooks, standard operating procedures, and full-text search indexing.</div>',
         unsafe_allow_html=True
     )
-    st.info("The Knowledge Base and RAG pipeline will be connected in Phase 4.")
+
+    try:
+        kb_docs = rag_service.list_documents()
+    except Exception as kb_err:
+        st.error(f"Error loading knowledge documents: {kb_err}")
+        kb_docs = []
+
+    total_chunks_indexed = sum(int(d.get("chunk_count") or 0) for d in kb_docs)
+
+    # Summary Metrics Row
+    m_col1, m_col2, m_col3, m_col4 = st.columns(4)
+    with m_col1:
+        st.markdown(_clean_html_block(f"""
+        <div class="metric-card">
+            <div class="metric-label">TOTAL RUNBOOKS</div>
+            <div class="metric-value">{len(kb_docs)}</div>
+            <div class="metric-note">Indexed documents</div>
+        </div>
+        """), unsafe_allow_html=True)
+    with m_col2:
+        st.markdown(_clean_html_block(f"""
+        <div class="metric-card">
+            <div class="metric-label">INDEXED CHUNKS</div>
+            <div class="metric-value">{total_chunks_indexed}</div>
+            <div class="metric-note">Searchable knowledge segments</div>
+        </div>
+        """), unsafe_allow_html=True)
+    with m_col3:
+        st.markdown(_clean_html_block("""
+        <div class="metric-card">
+            <div class="metric-label">SUPPORTED FORMATS</div>
+            <div class="metric-value" style="font-size: 20px; line-height: 1.8;">PDF, TXT, MD</div>
+            <div class="metric-note">Text extraction & OCR check</div>
+        </div>
+        """), unsafe_allow_html=True)
+    with m_col4:
+        st.markdown(_clean_html_block("""
+        <div class="metric-card">
+            <div class="metric-label">SEARCH ENGINE</div>
+            <div class="metric-value" style="font-size: 20px; line-height: 1.8;">SQLite FTS5</div>
+            <div class="metric-note">BM25 ranked relevance</div>
+        </div>
+        """), unsafe_allow_html=True)
+
+    st.write("")
+
+    # Primary Knowledge Base Tabs
+    tab_inventory, tab_upload, tab_search = st.tabs([
+        "📚 Document Inventory & Inspector",
+        "📤 Upload & Ingest Runbooks",
+        "🔍 Retrieval Search Preview"
+    ])
+
+    # --------------------------------------------------------------------------
+    # TAB 1: DOCUMENT INVENTORY & CHUNK INSPECTOR
+    # --------------------------------------------------------------------------
+    with tab_inventory:
+        if not kb_docs:
+            st.info(
+                "The Knowledge Base is currently empty (0 indexed documents). "
+                "Switch to the **Upload & Ingest Runbooks** tab to upload and index standard "
+                "operational runbooks or procedures."
+            )
+        else:
+            st.markdown("#### Indexed Document Repository")
+
+            # Document Selection for Detail & Chunk Inspection
+            doc_options = [
+                f"ID #{d['id']} • {d['document_name']} ({_format_file_size(d.get('file_size_bytes', 0))}, {d.get('chunk_count', 0)} chunks)"
+                for d in kb_docs
+            ]
+            sel_doc_idx = 0
+            if "selected_kb_doc_id" in st.session_state:
+                for i, d in enumerate(kb_docs):
+                    if d["id"] == st.session_state["selected_kb_doc_id"]:
+                        sel_doc_idx = i
+                        break
+
+            selected_doc_label = st.selectbox(
+                "Select Document to Inspect & Manage",
+                options=doc_options,
+                index=sel_doc_idx,
+                key="kb_doc_inspector_select"
+            )
+            sel_doc = kb_docs[doc_options.index(selected_doc_label)]
+            st.session_state["selected_kb_doc_id"] = sel_doc["id"]
+
+            # Document Metadata Card
+            doc_id_val = sel_doc.get("id")
+            doc_name_val = sel_doc.get("document_name", "Unknown")
+            doc_type_val = sel_doc.get("document_type", "N/A")
+            doc_size_val = _format_file_size(sel_doc.get("file_size_bytes", 0))
+            doc_chunks_val = sel_doc.get("chunk_count", 0)
+            doc_status_val = sel_doc.get("status", "Indexed")
+            doc_time_val = helpers.format_timestamp(sel_doc.get("uploaded_at"))
+            doc_hash_val = (sel_doc.get("content_hash") or "")[:16]
+
+            st.markdown(_clean_html_block(f"""
+            <div class="journey-stage-card" style="border-left-color: #315BEA; padding: 18px 20px;">
+                <div style="display: flex; justify-content: space-between; align-items: center; margin-bottom: 12px;">
+                    <span style="font-size: 16px; font-weight: 700; color: #0F172A;">{_safe_html_text(doc_name_val)}</span>
+                    <span class="journey-step-pill completed">{_safe_html_text(doc_status_val)}</span>
+                </div>
+                <div style="display: grid; grid-template-columns: repeat(auto-fit, minmax(170px, 1fr)); gap: 12px; font-size: 13px;">
+                    <div><span class="metric-note">DOCUMENT ID:</span><br><strong>#{doc_id_val}</strong></div>
+                    <div><span class="metric-note">FILE TYPE:</span><br><strong>{_safe_html_text(doc_type_val)}</strong></div>
+                    <div><span class="metric-note">FILE SIZE:</span><br><strong>{_safe_html_text(doc_size_val)}</strong></div>
+                    <div><span class="metric-note">INDEXED CHUNKS:</span><br><strong>{doc_chunks_val} chunks</strong></div>
+                    <div><span class="metric-note">INGESTION DATE:</span><br><strong>{_safe_html_text(doc_time_val)}</strong></div>
+                    <div><span class="metric-note">CONTENT SHA-256:</span><br><code style="font-size: 11px;">{_safe_html_text(doc_hash_val)}...</code></div>
+                </div>
+            </div>
+            """), unsafe_allow_html=True)
+
+            # Chunk Inspector
+            st.markdown(f"#### Chunk Inspector ({doc_chunks_val} Chunks)")
+            doc_chunks = rag_service.get_document_chunks(doc_id_val)
+
+            if not doc_chunks:
+                st.caption("No chunks recorded for this document.")
+            else:
+                for idx, chunk in enumerate(doc_chunks):
+                    chunk_id = chunk.get("id")
+                    c_idx = chunk.get("chunk_index", idx)
+                    page_num = chunk.get("page_number", 1)
+                    content = chunk.get("content", "")
+                    char_cnt = len(content)
+                    citation_str = rag_service.format_source_citation(doc_name_val, page_num, c_idx, compact=True)
+
+                    with st.expander(
+                        f"Chunk #{c_idx + 1} • ID #{chunk_id} • Page {page_num} • {char_cnt} characters",
+                        expanded=(idx == 0)
+                    ):
+                        st.markdown(
+                            f'<span class="citation-badge">{_safe_html_text(citation_str)}</span> '
+                            f'<span class="metric-note" style="margin-left: 8px;">Page {page_num} • Chunk Index {c_idx}</span>',
+                            unsafe_allow_html=True
+                        )
+                        st.text_area(
+                            label=f"Chunk Content #{chunk_id}",
+                            value=content,
+                            height=min(220, max(80, char_cnt // 4)),
+                            disabled=True,
+                            key=f"chunk_viewer_{chunk_id}",
+                            label_visibility="collapsed"
+                        )
+
+            # Safe Document Deletion Workflow
+            st.divider()
+            with st.expander("🗑️ Delete Document", expanded=False):
+                st.markdown(_clean_html_block(f"""
+                <div style="background: #FEF2F2; border: 1px solid #FECDD3; border-radius: 8px; padding: 14px 16px; margin-bottom: 12px;">
+                    <strong style="color: #991B1B;">⚠️ Permanent Action: Document & Chunk Removal</strong>
+                    <div style="font-size: 13px; color: #B91C1C; margin-top: 4px;">
+                        Deleting <strong>{_safe_html_text(doc_name_val)}</strong> will permanently remove the storage file from disk,
+                        delete all {doc_chunks_val} associated chunks from the database, and clear its SQLite FTS5 search index entries.
+                        This action cannot be undone.
+                    </div>
+                </div>
+                """), unsafe_allow_html=True)
+
+                confirm_del = st.checkbox(
+                    f"I confirm I want to permanently delete \"{doc_name_val}\" (ID #{doc_id_val})",
+                    key=f"confirm_delete_kb_{doc_id_val}"
+                )
+                if st.button("Delete Document Permanently", type="secondary", key=f"btn_delete_kb_{doc_id_val}"):
+                    if not confirm_del:
+                        st.warning("Please check the confirmation box above before executing deletion.")
+                    else:
+                        with st.spinner(f"Deleting '{doc_name_val}'..."):
+                            del_success = rag_service.delete_document(doc_id_val)
+                            if del_success:
+                                st.success(f"Document '{doc_name_val}' and all associated chunks were successfully deleted.")
+                                st.session_state.pop("selected_kb_doc_id", None)
+                                st.rerun()
+                            else:
+                                st.error(f"Failed to delete document '{doc_name_val}'. Please verify database connectivity.")
+
+    # --------------------------------------------------------------------------
+    # TAB 2: UPLOAD & INGEST RUNBOOKS
+    # --------------------------------------------------------------------------
+    with tab_upload:
+        st.markdown(_clean_html_block("""
+        <div class="journey-narrative-box">
+            <strong>Document Ingestion Guidelines</strong><br>
+            <span style="font-size: 13px; color: #475569;">
+                Upload enterprise runbooks, architectural overviews, or standard operating procedures (SOPs).
+                The ingestion pipeline extracts text, applies paragraph- and sentence-aware sliding-window chunking
+                (600 chars with 100 char overlap), and indexes content into SQLite FTS5 for BM25 retrieval.
+            </span>
+        </div>
+        """), unsafe_allow_html=True)
+
+        uploaded_file = st.file_uploader(
+            "Select runbook file to ingest (.pdf, .txt, .md)",
+            type=["pdf", "txt", "md"],
+            help="Maximum allowed file size: 10 MB. Supported extensions: .pdf, .txt, .md",
+            key="kb_runbook_uploader"
+        )
+
+        if uploaded_file is not None:
+            up_name = uploaded_file.name
+            up_bytes = uploaded_file.getvalue()
+            up_size_fmt = _format_file_size(len(up_bytes))
+
+            st.markdown(f"**Ready for ingestion:** `{up_name}` ({up_size_fmt})")
+
+            if st.button("Ingest and Index Document", type="primary", key="btn_execute_ingest"):
+                with st.spinner(f"Validating, chunking, and indexing '{up_name}'..."):
+                    try:
+                        doc_record = rag_service.ingest_document(
+                            file_name=up_name,
+                            file_bytes=up_bytes,
+                        )
+                        st.success(f"Successfully ingested and indexed '{doc_record['document_name']}'!")
+
+                        st.markdown(_clean_html_block(f"""
+                        <div class="journey-stage-card" style="border-left-color: #10B981; padding: 16px 20px;">
+                            <strong style="color: #065F46; font-size: 15px;">✓ Ingestion Complete</strong>
+                            <div style="display: grid; grid-template-columns: repeat(auto-fit, minmax(160px, 1fr)); gap: 10px; margin-top: 8px; font-size: 13px;">
+                                <div><span class="metric-note">DOCUMENT:</span><br><strong>{_safe_html_text(doc_record['document_name'])}</strong></div>
+                                <div><span class="metric-note">DOCUMENT ID:</span><br><strong>#{doc_record['document_id']}</strong></div>
+                                <div><span class="metric-note">CHUNKS CREATED:</span><br><strong>{doc_record['chunk_count']} chunks</strong></div>
+                                <div><span class="metric-note">STATUS:</span><br><span class="journey-step-pill completed">{_safe_html_text(doc_record['status'])}</span></div>
+                            </div>
+                        </div>
+                        """), unsafe_allow_html=True)
+
+                        st.session_state["selected_kb_doc_id"] = doc_record["document_id"]
+
+                    except rag_service.DuplicateDocumentError as dup_err:
+                        st.warning(f"⚠️ Duplicate Document: {dup_err}")
+                    except rag_service.FileSizeLimitError as size_err:
+                        st.error(f"❌ File Size Exceeded: {size_err}")
+                    except rag_service.UnsupportedFileTypeError as type_err:
+                        st.error(f"❌ Unsupported Format: {type_err}")
+                    except rag_service.EmptyExtractedContentError as empty_err:
+                        st.error(f"⚠️ Unreadable Content: {empty_err}")
+                    except rag_service.TextExtractionError as extract_err:
+                        st.error(f"❌ Text Extraction Error: {extract_err}")
+                    except rag_service.InvalidFilenameError as name_err:
+                        st.error(f"❌ Invalid Filename: {name_err}")
+                    except rag_service.PersistenceError as persist_err:
+                        st.error(f"❌ Storage Persistence Error: {persist_err}")
+                    except Exception as gen_err:
+                        st.error(f"❌ Ingestion Failed: {gen_err}")
+
+    # --------------------------------------------------------------------------
+    # TAB 3: RETRIEVAL & SEARCH PREVIEW
+    # --------------------------------------------------------------------------
+    with tab_search:
+        st.markdown(_clean_html_block("""
+        <div class="journey-narrative-box" style="border-left: 4px solid #3B82F6; background: #EFF6FF;">
+            <strong style="color: #1D4ED8;">🛡️ Grounded Retrieval Boundary</strong><br>
+            <span style="font-size: 13px; color: #1E40AF;">
+                Results below represent raw, unmanipulated runbook chunks retrieved directly from the SQLite FTS5 BM25 index.
+                No generative AI inference, rewriting, or synthesis has been applied.
+            </span>
+        </div>
+        """), unsafe_allow_html=True)
+
+        if not kb_docs:
+            st.info(
+                "The Knowledge Base is currently empty (0 indexed documents). "
+                "Upload documents in the **Upload & Ingest Runbooks** tab to test retrieval."
+            )
+        else:
+            search_col1, search_col2 = st.columns([4, 1])
+            with search_col1:
+                search_query = st.text_input(
+                    "Search Knowledge Base via FTS5 / BM25",
+                    placeholder="e.g. checkout timeout 504 gateway connection pool",
+                    key="kb_fts_search_query"
+                )
+            with search_col2:
+                search_limit = st.selectbox(
+                    "Max Chunks",
+                    options=[3, 5, 10, 15],
+                    index=1,
+                    key="kb_fts_search_limit"
+                )
+
+            if search_query and search_query.strip():
+                clean_q = search_query.strip()
+                with st.spinner("Searching SQLite FTS5 BM25 index..."):
+                    search_results = rag_service.retrieve_knowledge_chunks(
+                        query=clean_q,
+                        limit=search_limit
+                    )
+
+                if not search_results:
+                    st.warning(
+                        f'No matching runbook chunks found for query: "{clean_q}". '
+                        'Try searching for specific technical terms, error codes (e.g. 504), or component names.'
+                    )
+                else:
+                    st.markdown(f"**Retrieved {len(search_results)} matching chunk(s) for query: `{clean_q}`**")
+                    for r in search_results:
+                        r_doc = r.get("document_name", "Unknown Document")
+                        r_page = r.get("page_number", 1)
+                        r_cidx = r.get("chunk_index", 0)
+                        r_cite = r.get("citation", "")
+                        r_bm25 = float(r.get("bm25_score", 0.0))
+                        r_rank = r.get("rank", 1)
+                        r_text = r.get("content", "")
+
+                        st.markdown(_clean_html_block(f"""
+                        <div class="diag-card" style="border-left: 3px solid #3B82F6; margin-bottom: 10px;">
+                            <div style="display: flex; justify-content: space-between; align-items: center; margin-bottom: 6px;">
+                                <div>
+                                    <span class="citation-badge">{_safe_html_text(r_cite)}</span>
+                                    <strong style="margin-left: 6px; font-size: 13px; color: #0F172A;">{_safe_html_text(r_doc)}</strong>
+                                    <span class="metric-note" style="margin-left: 8px;">Page {r_page} • Chunk #{r_cidx}</span>
+                                </div>
+                                <div>
+                                    <span class="metric-note">Rank #{r_rank} | BM25 Score: <code>{r_bm25:.4f}</code></span>
+                                </div>
+                            </div>
+                            <div style="background: #F8FAFC; border: 1px solid #E2E8F0; border-radius: 6px; padding: 10px 12px; font-size: 12.5px; color: #334155; font-family: monospace; white-space: pre-wrap; line-height: 1.45;">{_safe_html_text(r_text)}</div>
+                        </div>
+                        """), unsafe_allow_html=True)
+            else:
+                st.caption("Enter search keywords above to test FTS5 BM25 retrieval against indexed runbooks.")
 
 elif page == "Simulation Lab":
     st.markdown('<div class="eyebrow">LAB / SCENARIOS</div>', unsafe_allow_html=True)

@@ -887,3 +887,78 @@ def retrieve_knowledge_for_incident(
         "total_chunks_retrieved": len(chunks),
         "chunks": chunks,
     }
+
+
+# ==============================================================================
+# 7. DOCUMENT MANAGEMENT & DELETION SERVICE APIS
+# ==============================================================================
+
+def list_documents(
+    db_path: Optional[Union[Path, str]] = None,
+) -> List[Dict[str, Any]]:
+    """Retrieve all indexed knowledge documents as standard dictionaries, ordered newest first."""
+    rows = db.get_all_knowledge_documents(db_path=db_path)
+    return [dict(r) for r in rows]
+
+
+def get_document_by_id(
+    document_id: int,
+    db_path: Optional[Union[Path, str]] = None,
+) -> Optional[Dict[str, Any]]:
+    """Retrieve a single document record by its integer ID."""
+    if not isinstance(document_id, int) or document_id <= 0:
+        return None
+    row = db.get_knowledge_document_by_id(document_id, db_path=db_path)
+    return dict(row) if row is not None else None
+
+
+def get_document_chunks(
+    document_id: int,
+    db_path: Optional[Union[Path, str]] = None,
+) -> List[Dict[str, Any]]:
+    """Retrieve all chunks belonging to a document ordered by page and chunk index."""
+    if not isinstance(document_id, int) or document_id <= 0:
+        return []
+    rows = db.get_chunks_for_document(document_id, db_path=db_path)
+    return [dict(r) for r in rows]
+
+
+def delete_document(
+    document_id: int,
+    db_path: Optional[Union[Path, str]] = None,
+) -> bool:
+    """Safely delete a document, its physical storage file, chunks, and FTS5 index entries.
+
+    Guarantees:
+    1. Validates document existence.
+    2. Retrieves document record to obtain file_path before deletion.
+    3. Deletes database record via db.delete_knowledge_document(), triggering
+       foreign-key cascade chunk deletion and FTS5 synchronization triggers.
+    4. Safely removes the physical file from disk if present. If disk unlinking
+       encounters an OS error, it is safely handled without leaving an inconsistent database state.
+    5. Returns True if successfully deleted, False if document was not found or invalid ID.
+    """
+    if not isinstance(document_id, int) or document_id <= 0:
+        return False
+
+    doc = db.get_knowledge_document_by_id(document_id, db_path=db_path)
+    if doc is None:
+        return False
+
+    file_path_str = doc["file_path"] if "file_path" in doc.keys() else None
+
+    # Delete from database; triggers CASCADE chunk deletion and FTS cleanup
+    db_deleted = db.delete_knowledge_document(document_id, db_path=db_path)
+    if not db_deleted:
+        return False
+
+    # Clean up physical file on disk if it exists
+    if file_path_str:
+        try:
+            p = Path(file_path_str)
+            if p.exists() and p.is_file():
+                p.unlink()
+        except OSError:
+            pass
+
+    return True

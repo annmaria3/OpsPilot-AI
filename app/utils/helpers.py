@@ -108,6 +108,11 @@ def format_timestamp(
     return str_val
 
 
+def get_utc_now() -> str:
+    """Return the current timestamp formatted as a standard SQLite timestamp string."""
+    return datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+
+
 def row_to_dict(row: Optional[sqlite3.Row]) -> Optional[Dict[str, Any]]:
     """Safely convert a sqlite3.Row object into a standard Python dictionary.
 
@@ -293,5 +298,28 @@ def clean_html_block(html_str: Any) -> str:
     return "\n".join(clean_lines)
 
 
+def format_file_size(size_bytes: Optional[Union[int, float]]) -> str:
+    """Format raw byte counts into human-readable strings.
 
+    Example:
+        format_file_size(512) -> "512 B"
+        format_file_size(24576) -> "24.0 KB"
+        format_file_size(1572864) -> "1.5 MB"
+    """
+    if size_bytes is None:
+        return "0 B"
+    try:
+        bytes_val = float(size_bytes)
+        if bytes_val < 0:
+            return "0 B"
+    except (TypeError, ValueError):
+        return "0 B"
 
+    if bytes_val < 1024:
+        return f"{int(bytes_val)} B"
+    elif bytes_val < 1024 * 1024:
+        return f"{bytes_val / 1024:.1f} KB"
+    elif bytes_val < 1024 * 1024 * 1024:
+        return f"{bytes_val / (1024 * 1024):.1f} MB"
+    else:
+        return f"{bytes_val / (1024 * 1024 * 1024):.1f} GB"
